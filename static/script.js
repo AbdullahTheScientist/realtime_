@@ -18,8 +18,37 @@ function closeSocket() {
   }
 }
 
+let latestFrame = null;   // most recent undrawn frame Blob
+let decoding = false;      // guards against overlapping decode/draw work
+
+function renderLoop() {
+  if (!decoding && latestFrame) {
+    const blob = latestFrame;
+    latestFrame = null; // any newer frame that arrives while we decode wins next
+    decoding = true;
+
+    createImageBitmap(blob)
+      .then((bitmap) => {
+        if (videoCanvas.width !== bitmap.width || videoCanvas.height !== bitmap.height) {
+          videoCanvas.width = bitmap.width;
+          videoCanvas.height = bitmap.height;
+        }
+        ctx.drawImage(bitmap, 0, 0);
+        bitmap.close();
+      })
+      .catch((err) => console.error("Failed to decode frame:", err))
+      .finally(() => {
+        decoding = false;
+      });
+  }
+  requestAnimationFrame(renderLoop);
+}
+requestAnimationFrame(renderLoop);
+
 function startStream() {
   closeSocket();
+  latestFrame = null;
+  decoding = false;
 
   const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
   socket = new WebSocket(`${proto}//${window.location.host}/ws/video_feed`);
@@ -29,26 +58,20 @@ function startStream() {
     streamStatus.textContent = "";
   };
 
-  socket.onmessage = async (event) => {
+  socket.onmessage = (event) => {
     // Text messages are error payloads (e.g. "no video uploaded"); binary
-    // messages are WebP frames to draw straight onto the canvas.
+    // messages are WebP frames. We only ever keep the newest one - if the
+    // render loop is still busy with a previous frame when new ones arrive,
+    // older undrawn frames are simply dropped instead of queued. Without
+    // this, a decode/draw that's briefly slower than the frame interval
+    // causes a backlog that never catches up, which looks like slow-motion
+    // playback (every frame still gets shown, just later and later).
     if (typeof event.data === "string") {
       const msg = JSON.parse(event.data);
       streamStatus.textContent = msg.error || "";
       return;
     }
-
-    try {
-      const bitmap = await createImageBitmap(event.data);
-      if (videoCanvas.width !== bitmap.width || videoCanvas.height !== bitmap.height) {
-        videoCanvas.width = bitmap.width;
-        videoCanvas.height = bitmap.height;
-      }
-      ctx.drawImage(bitmap, 0, 0);
-      bitmap.close();
-    } catch (err) {
-      console.error("Failed to decode frame:", err);
-    }
+    latestFrame = event.data;
   };
 
   socket.onerror = () => {

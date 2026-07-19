@@ -134,6 +134,9 @@ async def ws_video_feed(websocket: WebSocket):
         fps = 25.0
     frame_delay = 1.0 / fps
 
+    stream_start = time.time()
+    frame_index = 0
+
     try:
         while True:
             start = time.time()
@@ -144,6 +147,7 @@ async def ws_video_feed(websocket: WebSocket):
             success, frame = await asyncio.to_thread(cap.read)
             if not success:
                 break  # end of video
+            frame_index += 1
 
             if state["detect"]:
                 frame = await asyncio.to_thread(detect_persons, frame)
@@ -158,12 +162,23 @@ async def ws_video_feed(websocket: WebSocket):
 
             # Pace playback to roughly match the source FPS. If a frame
             # (detection especially) took longer than the budget, skip the
-            # sleep entirely instead of trying to "catch up" later - this
-            # keeps the stream from drifting further and further behind.
+            # sleep entirely instead of trying to "catch up" later.
             elapsed = time.time() - start
             remaining = frame_delay - elapsed
             if remaining > 0:
                 await asyncio.sleep(remaining)
+            else:
+                # We're behind schedule. If processing (usually detection)
+                # is consistently slower than real-time and we've drifted
+                # more than a couple of frames behind the video's own
+                # timeline, catch up by skipping ahead rather than grinding
+                # through the backlog one late frame at a time - which is
+                # what "everything plays, just in slow motion" looks like.
+                target_frame = int((time.time() - stream_start) / frame_delay)
+                behind_by = target_frame - frame_index
+                if behind_by > 2:
+                    await asyncio.to_thread(cap.set, cv2.CAP_PROP_POS_FRAMES, target_frame)
+                    frame_index = target_frame
     except WebSocketDisconnect:
         pass
     finally:
