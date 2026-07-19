@@ -27,6 +27,12 @@ PERSON_CLASS_ID = 0
 CONF_THRESHOLD = 0.4
 INFER_SIZE = 320   # inference resolution; 320 is a good speed/accuracy tradeoff on GPU too
 
+# Output stream settings - these control how much data has to travel over the
+# network per frame. If playback lags/slows down, the network can't keep up
+# with the current bitrate; lower STREAM_MAX_WIDTH and/or JPEG_QUALITY first.
+STREAM_MAX_WIDTH = 640   # frames wider than this get downscaled before sending
+JPEG_QUALITY = 65        # 0-100; lower = smaller frames = less bandwidth needed
+
 DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
 print(f"[startup] YOLO will run on: {DEVICE}"
       + (f" ({torch.cuda.get_device_name(0)})" if DEVICE.startswith("cuda") else " (no GPU detected)"))
@@ -136,7 +142,14 @@ def generate_frames(video_path: str, detect: bool = True):
             if detect:
                 frame = detect_persons(frame)
 
-            ok, buffer = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+            # downscale for network transport - detection already ran at
+            # full/INFER_SIZE resolution above, this only affects what gets sent
+            h, w = frame.shape[:2]
+            if w > STREAM_MAX_WIDTH:
+                scale = STREAM_MAX_WIDTH / w
+                frame = cv2.resize(frame, (STREAM_MAX_WIDTH, int(h * scale)))
+
+            ok, buffer = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY])
             if not ok:
                 continue
 
