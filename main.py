@@ -4,7 +4,6 @@ import time
 import threading
 
 import cv2
-import torch
 from fastapi import FastAPI, File, UploadFile
 from fastapi.responses import StreamingResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -21,36 +20,24 @@ app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 # Keep track of the currently uploaded video, whether detection is on,
 # and a lock so only one capture reads the file at a time.
+state = {
+    "video_path": None,
+    "detect": True,  # person detection on by default
+}
+lock = threading.Lock()
+
 # Load the lightweight YOLOv8 nano model once at startup.
 # COCO class 0 is "person" - we only ever keep that class.
 PERSON_CLASS_ID = 0
 CONF_THRESHOLD = 0.4
-INFER_SIZE = 320   # inference resolution; 320 is a good speed/accuracy tradeoff on GPU too
-
-# Output stream settings - these control how much data has to travel over the
-# network per frame. If playback lags/slows down, the network can't keep up
-# with the current bitrate; lower STREAM_MAX_WIDTH and/or JPEG_QUALITY.
-# If playback is smooth but looks soft/blocky, raise them - just watch for
-# lag creeping back in as you go up.
-STREAM_MAX_WIDTH = 960   # frames wider than this get downscaled before sending
-JPEG_QUALITY = 78        # 0-100; lower = smaller frames = less bandwidth needed
-
-DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
-print(f"[startup] YOLO will run on: {DEVICE}"
-      + (f" ({torch.cuda.get_device_name(0)})" if DEVICE.startswith("cuda") else " (no GPU detected)"))
-
 yolo_model = YOLO("yolov8n.pt")
-yolo_model.to(DEVICE)
-if DEVICE.startswith("cuda"):
-    # half-precision inference is faster on GPU with negligible accuracy loss for this model
-    yolo_model.model.half()
 
-state = {
-    "video_path": None,
-    "detect": True,     # person detection on by default
-    "fps": 25.0,
-}
-lock = threading.Lock()
+# Streaming codec: WebP produces meaningfully smaller frames than JPEG at
+# equivalent visual quality, so at the same bandwidth budget we can afford
+# a higher quality setting (or higher resolution) than JPEG allowed.
+STREAM_EXT = ".webp"
+STREAM_CONTENT_TYPE = "image/webp"
+STREAM_QUALITY = 80  # WebP quality (0-100); ~equivalent visual quality to JPEG 85 at a fraction of the size
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -75,10 +62,9 @@ async def upload_video(file: UploadFile = File(...)):
     with open(dest_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
 
-    # Quick sanity check that OpenCV can actually open it, and grab its FPS
+    # Quick sanity check that OpenCV can actually open it
     cap = cv2.VideoCapture(dest_path)
     opened = cap.isOpened()
-    fps = cap.get(cv2.CAP_PROP_FPS) if opened else 0
     cap.release()
     if not opened:
         os.remove(dest_path)
@@ -89,9 +75,8 @@ async def upload_video(file: UploadFile = File(...)):
 
     with lock:
         state["video_path"] = dest_path
-        state["fps"] = fps if fps and fps > 0 else 25.0
 
-    return {"filename": file.filename, "status": "uploaded", "fps": state["fps"]}
+    return {"filename": file.filename, "status": "uploaded"}
 
 
 def detect_persons(frame):
@@ -100,8 +85,6 @@ def detect_persons(frame):
         frame,
         classes=[PERSON_CLASS_ID],
         conf=CONF_THRESHOLD,
-        imgsz=INFER_SIZE,
-        device=DEVICE,
         verbose=False,
     )[0]
 
@@ -123,7 +106,7 @@ def detect_persons(frame):
 
 
 def generate_frames(video_path: str, detect: bool = True):
-    """Generator that reads the video with OpenCV and yields JPEG frames
+    """Generator that reads the video with OpenCV and yields WebP frames
     as a multipart/x-mixed-replace stream, paced to the source FPS."""
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -144,21 +127,14 @@ def generate_frames(video_path: str, detect: bool = True):
             if detect:
                 frame = detect_persons(frame)
 
-            # downscale for network transport - detection already ran at
-            # full/INFER_SIZE resolution above, this only affects what gets sent
-            h, w = frame.shape[:2]
-            if w > STREAM_MAX_WIDTH:
-                scale = STREAM_MAX_WIDTH / w
-                frame = cv2.resize(frame, (STREAM_MAX_WIDTH, int(h * scale)))
-
-            ok, buffer = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY])
+            ok, buffer = cv2.imencode(STREAM_EXT, frame, [int(cv2.IMWRITE_WEBP_QUALITY), STREAM_QUALITY])
             if not ok:
                 continue
 
             frame_bytes = buffer.tobytes()
             yield (
                 b"--frame\r\n"
-                b"Content-Type: image/jpeg\r\n"
+                b"Content-Type: " + STREAM_CONTENT_TYPE.encode() + b"\r\n"
                 b"Content-Length: " + str(len(frame_bytes)).encode() + b"\r\n\r\n"
                 + frame_bytes + b"\r\n"
             )
@@ -181,14 +157,6 @@ def video_feed():
     return StreamingResponse(
         generate_frames(video_path, detect=state["detect"]),
         media_type="multipart/x-mixed-replace; boundary=frame",
-        headers={
-            # discourage nginx-style reverse proxies (RunPod's HTTP proxy included)
-            # from buffering the stream before forwarding it to the browser
-            "Cache-Control": "no-cache, no-store, must-revalidate",
-            "Pragma": "no-cache",
-            "X-Accel-Buffering": "no",
-            "Connection": "keep-alive",
-        },
     )
 
 
@@ -203,15 +171,12 @@ def toggle_detect():
 def status():
     return {"video_loaded": state["video_path"] is not None,
             "filename": os.path.basename(state["video_path"]) if state["video_path"] else None,
-            "detect": state["detect"],
-            "fps": state["fps"]}
+            "detect": state["detect"]}
 
 
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
-
-
 
 
 # import os
