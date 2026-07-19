@@ -100,9 +100,17 @@ button:disabled {
   cursor: pointer;
 }
 
-#videoStream {
+#videoCanvas {
   width: 100%;
   border-radius: 12px;
   border: 1px solid #334155;
   background: black;
+  display: block;
+}
+
+.hint {
+  font-size: 0.8rem;
+  color: #64748b;
+  margin: 8px 0 0;
+  text-align: center;
 }

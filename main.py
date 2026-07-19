@@ -40,6 +40,7 @@ if DEVICE.startswith("cuda"):
 state = {
     "video_path": None,
     "detect": True,     # person detection on by default
+    "fps": 25.0,
 }
 lock = threading.Lock()
 
@@ -66,9 +67,10 @@ async def upload_video(file: UploadFile = File(...)):
     with open(dest_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
 
-    # Quick sanity check that OpenCV can actually open it
+    # Quick sanity check that OpenCV can actually open it, and grab its FPS
     cap = cv2.VideoCapture(dest_path)
     opened = cap.isOpened()
+    fps = cap.get(cv2.CAP_PROP_FPS) if opened else 0
     cap.release()
     if not opened:
         os.remove(dest_path)
@@ -79,8 +81,9 @@ async def upload_video(file: UploadFile = File(...)):
 
     with lock:
         state["video_path"] = dest_path
+        state["fps"] = fps if fps and fps > 0 else 25.0
 
-    return {"filename": file.filename, "status": "uploaded"}
+    return {"filename": file.filename, "status": "uploaded", "fps": state["fps"]}
 
 
 def detect_persons(frame):
@@ -163,6 +166,14 @@ def video_feed():
     return StreamingResponse(
         generate_frames(video_path, detect=state["detect"]),
         media_type="multipart/x-mixed-replace; boundary=frame",
+        headers={
+            # discourage nginx-style reverse proxies (RunPod's HTTP proxy included)
+            # from buffering the stream before forwarding it to the browser
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "Pragma": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
     )
 
 
@@ -177,7 +188,8 @@ def toggle_detect():
 def status():
     return {"video_loaded": state["video_path"] is not None,
             "filename": os.path.basename(state["video_path"]) if state["video_path"] else None,
-            "detect": state["detect"]}
+            "detect": state["detect"],
+            "fps": state["fps"]}
 
 
 if __name__ == "__main__":
