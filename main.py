@@ -1,11 +1,12 @@
 import os
 import shutil
 import time
+import asyncio
 import threading
 
 import cv2
-from fastapi import FastAPI, File, UploadFile
-from fastapi.responses import StreamingResponse, HTMLResponse, JSONResponse
+from fastapi import FastAPI, File, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from ultralytics import YOLO
 
@@ -36,7 +37,6 @@ yolo_model = YOLO("yolov8n.pt")
 # equivalent visual quality, so at the same bandwidth budget we can afford
 # a higher quality setting (or higher resolution) than JPEG allowed.
 STREAM_EXT = ".webp"
-STREAM_CONTENT_TYPE = "image/webp"
 STREAM_QUALITY = 80  # WebP quality (0-100); ~equivalent visual quality to JPEG 85 at a fraction of the size
 
 
@@ -105,11 +105,28 @@ def detect_persons(frame):
     return frame
 
 
-def generate_frames(video_path: str, detect: bool = True):
-    """Generator that reads the video with OpenCV and yields WebP frames
-    as a multipart/x-mixed-replace stream, paced to the source FPS."""
+@app.websocket("/ws/video_feed")
+async def ws_video_feed(websocket: WebSocket):
+    """Push WebP-encoded frames over a persistent WebSocket connection.
+
+    This replaces the old MJPEG (multipart/x-mixed-replace) transport.
+    A WebSocket avoids per-frame HTTP framing overhead and, critically,
+    lets the client toggle detection without tearing down and
+    re-establishing the whole connection - which is where most of the
+    perceived "lag" in the MJPEG version came from.
+    """
+    await websocket.accept()
+
+    video_path = state["video_path"]
+    if not video_path or not os.path.exists(video_path):
+        await websocket.send_json({"error": "No video uploaded yet"})
+        await websocket.close()
+        return
+
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
+        await websocket.send_json({"error": "OpenCV could not open this video."})
+        await websocket.close()
         return
 
     fps = cap.get(cv2.CAP_PROP_FPS)
@@ -120,44 +137,37 @@ def generate_frames(video_path: str, detect: bool = True):
     try:
         while True:
             start = time.time()
-            success, frame = cap.read()
+
+            # Blocking OpenCV/YOLO calls are offloaded to a thread so they
+            # never stall the event loop (which also has to service the
+            # WebSocket's own send/keepalive traffic).
+            success, frame = await asyncio.to_thread(cap.read)
             if not success:
                 break  # end of video
 
-            if detect:
-                frame = detect_persons(frame)
+            if state["detect"]:
+                frame = await asyncio.to_thread(detect_persons, frame)
 
-            ok, buffer = cv2.imencode(STREAM_EXT, frame, [int(cv2.IMWRITE_WEBP_QUALITY), STREAM_QUALITY])
+            ok, buffer = await asyncio.to_thread(
+                cv2.imencode, STREAM_EXT, frame, [int(cv2.IMWRITE_WEBP_QUALITY), STREAM_QUALITY]
+            )
             if not ok:
                 continue
 
-            frame_bytes = buffer.tobytes()
-            yield (
-                b"--frame\r\n"
-                b"Content-Type: " + STREAM_CONTENT_TYPE.encode() + b"\r\n"
-                b"Content-Length: " + str(len(frame_bytes)).encode() + b"\r\n\r\n"
-                + frame_bytes + b"\r\n"
-            )
+            await websocket.send_bytes(buffer.tobytes())
 
-            # pace playback to roughly match the source frame rate
+            # Pace playback to roughly match the source FPS. If a frame
+            # (detection especially) took longer than the budget, skip the
+            # sleep entirely instead of trying to "catch up" later - this
+            # keeps the stream from drifting further and further behind.
             elapsed = time.time() - start
             remaining = frame_delay - elapsed
             if remaining > 0:
-                time.sleep(remaining)
+                await asyncio.sleep(remaining)
+    except WebSocketDisconnect:
+        pass
     finally:
         cap.release()
-
-
-@app.get("/video_feed")
-def video_feed():
-    video_path = state["video_path"]
-    if not video_path or not os.path.exists(video_path):
-        return JSONResponse(status_code=404, content={"error": "No video uploaded yet"})
-
-    return StreamingResponse(
-        generate_frames(video_path, detect=state["detect"]),
-        media_type="multipart/x-mixed-replace; boundary=frame",
-    )
 
 
 @app.post("/toggle_detect")
@@ -177,7 +187,6 @@ def status():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
-
 
 # import os
 # import shutil
