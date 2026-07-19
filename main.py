@@ -5,10 +5,14 @@ import asyncio
 import threading
 
 import cv2
-from fastapi import FastAPI, File, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, File, UploadFile, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from ultralytics import YOLO
+
+from aiortc import RTCPeerConnection, RTCSessionDescription
+from aiortc.mediastreams import MediaStreamTrack, MediaStreamError, VIDEO_CLOCK_RATE, VIDEO_TIME_BASE
+from av import VideoFrame
 
 app = FastAPI(title="OpenCV Video Streamer")
 
@@ -27,17 +31,14 @@ state = {
 }
 lock = threading.Lock()
 
+# Active WebRTC peer connections, so we can clean them up on shutdown.
+pcs: set[RTCPeerConnection] = set()
+
 # Load the lightweight YOLOv8 nano model once at startup.
 # COCO class 0 is "person" - we only ever keep that class.
 PERSON_CLASS_ID = 0
 CONF_THRESHOLD = 0.4
 yolo_model = YOLO("yolov8n.pt")
-
-# Streaming codec: WebP produces meaningfully smaller frames than JPEG at
-# equivalent visual quality, so at the same bandwidth budget we can afford
-# a higher quality setting (or higher resolution) than JPEG allowed.
-STREAM_EXT = ".webp"
-STREAM_QUALITY = 80  # WebP quality (0-100); ~equivalent visual quality to JPEG 85 at a fraction of the size
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -105,76 +106,94 @@ def detect_persons(frame):
     return frame
 
 
-@app.websocket("/ws/video_feed")
-async def ws_video_feed(websocket: WebSocket):
-    """Push WebP-encoded frames over a persistent WebSocket connection.
+class DetectionVideoTrack(MediaStreamTrack):
+    """A WebRTC video track backed by an OpenCV VideoCapture.
 
-    This replaces the old MJPEG (multipart/x-mixed-replace) transport.
-    A WebSocket avoids per-frame HTTP framing overhead and, critically,
-    lets the client toggle detection without tearing down and
-    re-establishing the whole connection - which is where most of the
-    perceived "lag" in the MJPEG version came from.
+    Frames are paced using the source video's own real FPS and encoded with
+    proper RTP timestamps, so the browser's own jitter buffer handles
+    smooth, real-time playback - no more custom sleep/skip pacing logic.
     """
-    await websocket.accept()
 
+    kind = "video"
+
+    def __init__(self, video_path: str):
+        super().__init__()
+        self._cap = cv2.VideoCapture(video_path)
+        fps = self._cap.get(cv2.CAP_PROP_FPS)
+        if not fps or fps <= 0:
+            fps = 25.0
+        self._frame_interval = 1.0 / fps
+        self._timestamp = 0
+        self._start = None
+
+    async def _next_timestamp(self):
+        if self._start is None:
+            self._start = time.time()
+        else:
+            self._timestamp += int(self._frame_interval * VIDEO_CLOCK_RATE)
+            wait = self._start + (self._timestamp / VIDEO_CLOCK_RATE) - time.time()
+            if wait > 0:
+                await asyncio.sleep(wait)
+        return self._timestamp, VIDEO_TIME_BASE
+
+    async def recv(self):
+        if self.readyState != "live":
+            raise MediaStreamError
+
+        success, frame = await asyncio.to_thread(self._cap.read)
+        if not success:
+            self.stop()
+            raise MediaStreamError  # end of video
+
+        if state["detect"]:
+            frame = await asyncio.to_thread(detect_persons, frame)
+
+        video_frame = VideoFrame.from_ndarray(frame, format="bgr24")
+        video_frame.pts, video_frame.time_base = await self._next_timestamp()
+        return video_frame
+
+    def stop(self):
+        super().stop()
+        if self._cap is not None:
+            self._cap.release()
+            self._cap = None
+
+
+@app.post("/offer")
+async def offer(request: Request):
+    """WebRTC signaling endpoint. The browser POSTs its SDP offer here and
+    gets back an SDP answer, after which video flows over a real RTP/WebRTC
+    connection (H.264 or VP8, whichever the browser negotiates)."""
     video_path = state["video_path"]
     if not video_path or not os.path.exists(video_path):
-        await websocket.send_json({"error": "No video uploaded yet"})
-        await websocket.close()
-        return
+        return JSONResponse(status_code=404, content={"error": "No video uploaded yet"})
 
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        await websocket.send_json({"error": "OpenCV could not open this video."})
-        await websocket.close()
-        return
+    params = await request.json()
+    offer_desc = RTCSessionDescription(sdp=params["sdp"], type=params["type"])
 
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    if not fps or fps <= 0:
-        fps = 25.0
-    frame_delay = 1.0 / fps
+    pc = RTCPeerConnection()
+    pcs.add(pc)
 
-    try:
-        while True:
-            start = time.time()
+    @pc.on("connectionstatechange")
+    async def on_connectionstatechange():
+        if pc.connectionState in ("failed", "closed", "disconnected"):
+            await pc.close()
+            pcs.discard(pc)
 
-            # Blocking OpenCV/YOLO calls are offloaded to a thread so they
-            # never stall the event loop (which also has to service the
-            # WebSocket's own send/keepalive traffic).
-            success, frame = await asyncio.to_thread(cap.read)
-            if not success:
-                break  # end of video
+    track = DetectionVideoTrack(video_path)
+    pc.addTrack(track)
 
-            if state["detect"]:
-                frame = await asyncio.to_thread(detect_persons, frame)
+    await pc.setRemoteDescription(offer_desc)
+    answer = await pc.createAnswer()
+    await pc.setLocalDescription(answer)
 
-            ok, buffer = await asyncio.to_thread(
-                cv2.imencode, STREAM_EXT, frame, [int(cv2.IMWRITE_WEBP_QUALITY), STREAM_QUALITY]
-            )
-            if not ok:
-                continue
+    return {"sdp": pc.localDescription.sdp, "type": pc.localDescription.type}
 
-            await websocket.send_bytes(buffer.tobytes())
 
-            # Pace playback to roughly match the source FPS. If a frame
-            # (detection especially) took longer than the budget, skip the
-            # sleep entirely instead of trying to "catch up" later - this
-            # keeps the stream from drifting further and further behind.
-            # Note: we deliberately do NOT seek/skip frames to "catch up" -
-            # cv2's frame-accurate seeking is unreliable on many real-world
-            # H.264/VFR files and can jump to the wrong position, which is
-            # what previously caused faster-than-source playback. If
-            # detection is consistently slower than the source frame rate,
-            # the honest result is that playback takes longer than the
-            # source duration - every frame is shown, just not in real time.
-            elapsed = time.time() - start
-            remaining = frame_delay - elapsed
-            if remaining > 0:
-                await asyncio.sleep(remaining)
-    except WebSocketDisconnect:
-        pass
-    finally:
-        cap.release()
+@app.on_event("shutdown")
+async def on_shutdown():
+    await asyncio.gather(*(pc.close() for pc in pcs))
+    pcs.clear()
 
 
 @app.post("/toggle_detect")
