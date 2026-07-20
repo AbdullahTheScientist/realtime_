@@ -101,6 +101,7 @@ button:disabled {
 }
 
 #videoStream {
+  display: block;
   width: 100%;
   border-radius: 12px;
   border: 1px solid #334155;

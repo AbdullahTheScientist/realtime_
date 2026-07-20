@@ -305,7 +305,7 @@ app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static2")
 # much faster and with far less frame-to-frame variance than WebP (the old
 # variance was a real source of visible jitter).
 STREAM_MAX_WIDTH = 560   # transport downscale; inference still runs full-res
-JPEG_QUALITY = 65        # good quality/size tradeoff for a constrained link
+JPEG_QUALITY = 55        # lowered for clear margin under the ~2.7 Mbps link
 # Cap the SENT frame rate below the source. Measured delivery sits right at the
 # link ceiling at 24 fps (socket send blocks ~31 of every ~41 ms), leaving no
 # headroom - so any network dip lands a frame late and the <img> element, which
