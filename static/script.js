@@ -3,85 +3,151 @@ const uploadBtn = document.getElementById("uploadBtn");
 const statusMsg = document.getElementById("statusMsg");
 const streamBox = document.getElementById("streamBox");
 const streamTitle = document.getElementById("streamTitle");
-const videoStream = document.getElementById("videoStream");
-const streamStatus = document.getElementById("streamStatus");
 const detectToggle = document.getElementById("detectToggle");
+const canvas = document.getElementById("videoCanvas");
+const bufferMsg = document.getElementById("bufferMsg");
+const ctx = canvas.getContext("2d");
 
-let pc = null;
+// --- Jitter-buffered MJPEG player -----------------------------------------
+// A plain <img src="/video_feed"> paints frames the instant they arrive,
+// so any network jitter (common on real internet links) shows up directly
+// as stutter/skipped frames. Instead, we read the raw multipart stream
+// ourselves, queue a handful of decoded frames first, then play them out
+// on a steady timer. This trades a small fixed delay (a few hundred ms)
+// for much smoother playback.
 
-function closeConnection() {
-  if (pc) {
-    pc.close();
-    pc = null;
+const TARGET_BUFFER_FRAMES = 6; // frames to queue before playback starts
+let frameQueue = [];
+let playing = false;
+let playTimer = null;
+let currentAbortController = null;
+
+function stopStream() {
+  playing = false;
+  if (playTimer) {
+    clearTimeout(playTimer);
+    playTimer = null;
   }
-  videoStream.srcObject = null;
+  if (currentAbortController) {
+    currentAbortController.abort();
+    currentAbortController = null;
+  }
+  frameQueue.forEach((bmp) => bmp.close && bmp.close());
+  frameQueue = [];
 }
 
-// aiortc's /offer endpoint answers with a complete (non-trickle) SDP, so we
-// wait for ICE gathering to finish before sending the offer - this is the
-// standard pattern for a single-shot offer/answer exchange.
-function waitForIceGatheringComplete(peerConnection) {
-  if (peerConnection.iceGatheringState === "complete") {
-    return Promise.resolve();
+function findSubarray(buf, pattern, from) {
+  outer: for (let i = from; i <= buf.length - pattern.length; i++) {
+    for (let j = 0; j < pattern.length; j++) {
+      if (buf[i + j] !== pattern[j]) continue outer;
+    }
+    return i;
   }
-  return new Promise((resolve) => {
-    function check() {
-      if (peerConnection.iceGatheringState === "complete") {
-        peerConnection.removeEventListener("icegatheringstatechange", check);
-        resolve();
+  return -1;
+}
+
+const CRLFCRLF = new Uint8Array([13, 10, 13, 10]);
+
+async function readMjpegStream(url, onFrame) {
+  currentAbortController = new AbortController();
+  const res = await fetch(url, { signal: currentAbortController.signal });
+  if (!res.ok || !res.body) throw new Error("Stream request failed: " + res.status);
+
+  const reader = res.body.getReader();
+  let buf = new Uint8Array(0);
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+
+    // append newly-received bytes onto our working buffer
+    const merged = new Uint8Array(buf.length + value.length);
+    merged.set(buf, 0);
+    merged.set(value, buf.length);
+    buf = merged;
+
+    // try to extract as many complete frames as are currently available
+    while (true) {
+      const headerEnd = findSubarray(buf, CRLFCRLF, 0);
+      if (headerEnd === -1) break; // headers not fully received yet
+
+      const headerText = new TextDecoder().decode(buf.subarray(0, headerEnd));
+      const lengthMatch = headerText.match(/Content-Length:\s*(\d+)/i);
+      const typeMatch = headerText.match(/Content-Type:\s*([\w/]+)/i);
+      if (!lengthMatch) {
+        // malformed/unexpected chunk; drop up to end of headers and retry
+        buf = buf.subarray(headerEnd + 4);
+        continue;
       }
+      const contentLength = parseInt(lengthMatch[1], 10);
+      const mimeType = typeMatch ? typeMatch[1] : "image/jpeg";
+      const frameStart = headerEnd + 4;
+      const frameEnd = frameStart + contentLength;
+
+      if (buf.length < frameEnd + 2) break; // full frame not received yet
+
+      const imgBytes = buf.slice(frameStart, frameEnd);
+      onFrame(imgBytes, mimeType);
+
+      // advance past this frame + trailing CRLF, then past next boundary line
+      let next = frameEnd + 2;
+      const nextHeaderStart = findSubarray(buf, CRLFCRLF, next);
+      buf = nextHeaderStart === -1 ? buf.subarray(next) : buf.subarray(next);
     }
-    peerConnection.addEventListener("icegatheringstatechange", check);
-  });
+  }
 }
 
-async function startStream() {
-  closeConnection();
-  streamStatus.textContent = "Connecting...";
+async function startStream(fps) {
+  stopStream();
+  playing = true;
+  const interval = 1000 / (fps && fps > 0 ? fps : 25);
+  bufferMsg.textContent = "Buffering...";
 
-  pc = new RTCPeerConnection({
-    iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
+  const onFrame = async (imgBytes, mimeType) => {
+    try {
+      const blob = new Blob([imgBytes], { type: mimeType });
+      const bitmap = await createImageBitmap(blob);
+      frameQueue.push(bitmap);
+    } catch (e) {
+      // corrupt/partial frame, skip it
+    }
+  };
+
+  readMjpegStream("/video_feed?t=" + Date.now(), onFrame).catch((err) => {
+    if (err.name !== "AbortError") console.error("Stream error:", err);
   });
 
-  pc.ontrack = (event) => {
-    videoStream.srcObject = event.streams[0];
-    streamStatus.textContent = "";
-  };
+  const playLoop = () => {
+    if (!playing) return;
 
-  pc.onconnectionstatechange = () => {
-    if (pc.connectionState === "failed" || pc.connectionState === "disconnected") {
-      streamStatus.textContent = "Stream connection lost.";
-    } else if (pc.connectionState === "closed") {
-      streamStatus.textContent = "Stream ended.";
-    }
-  };
-
-  pc.addTransceiver("video", { direction: "recvonly" });
-
-  const offerDesc = await pc.createOffer();
-  await pc.setLocalDescription(offerDesc);
-  await waitForIceGatheringComplete(pc);
-
-  try {
-    const res = await fetch("/offer", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        sdp: pc.localDescription.sdp,
-        type: pc.localDescription.type,
-      }),
-    });
-    const answer = await res.json();
-
-    if (!res.ok) {
-      streamStatus.textContent = answer.error || "Failed to start stream.";
-      return;
+    if (frameQueue.length > 0) {
+      const bmp = frameQueue.shift();
+      if (canvas.width !== bmp.width || canvas.height !== bmp.height) {
+        canvas.width = bmp.width;
+        canvas.height = bmp.height;
+      }
+      ctx.drawImage(bmp, 0, 0);
+      bmp.close && bmp.close();
+      bufferMsg.textContent = `Buffer: ${frameQueue.length} frame(s)`;
+    } else {
+      bufferMsg.textContent = "Waiting for frames...";
     }
 
-    await pc.setRemoteDescription(answer);
-  } catch (err) {
-    streamStatus.textContent = "Connection failed: " + err.message;
-  }
+    playTimer = setTimeout(playLoop, interval);
+  };
+
+  // wait until we have a small buffer built up before starting playback,
+  // so brief network hiccups don't immediately cause a stall
+  const waitForBuffer = () => {
+    if (!playing) return;
+    if (frameQueue.length >= TARGET_BUFFER_FRAMES) {
+      bufferMsg.textContent = "";
+      playLoop();
+    } else {
+      setTimeout(waitForBuffer, 50);
+    }
+  };
+  waitForBuffer();
 }
 
 uploadBtn.addEventListener("click", async () => {
@@ -97,13 +163,10 @@ uploadBtn.addEventListener("click", async () => {
   uploadBtn.disabled = true;
   statusMsg.textContent = "Uploading...";
   streamBox.style.display = "none";
-  closeConnection();
+  stopStream();
 
   try {
-    const res = await fetch("/upload", {
-      method: "POST",
-      body: formData,
-    });
+    const res = await fetch("/upload", { method: "POST", body: formData });
     const data = await res.json();
 
     if (!res.ok) {
@@ -113,9 +176,9 @@ uploadBtn.addEventListener("click", async () => {
 
     statusMsg.textContent = `Uploaded "${data.filename}". Starting stream...`;
     streamTitle.textContent = `Live Stream: ${data.filename}`;
-
     streamBox.style.display = "block";
-    await startStream();
+
+    startStream(data.fps);
   } catch (err) {
     statusMsg.textContent = "Upload failed: " + err.message;
   } finally {
@@ -125,10 +188,15 @@ uploadBtn.addEventListener("click", async () => {
 
 detectToggle.addEventListener("change", async () => {
   try {
-    // The video track reads the shared "detect" flag on every frame, so
-    // toggling it takes effect on the next frame - no reconnect needed.
-    await fetch("/toggle_detect", { method: "POST" });
+    const res = await fetch("/toggle_detect", { method: "POST" });
+    const data = await res.json();
+    console.log("detect:", data.detect);
   } catch (err) {
     console.error("Failed to toggle detection:", err);
+  } finally {
+    // restart the stream connection so the new mode takes effect immediately
+    fetch("/status")
+      .then((r) => r.json())
+      .then((s) => startStream(s.fps));
   }
 });
