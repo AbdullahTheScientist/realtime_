@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>OpenCV Video Streamer</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <div class="container">
+    <h1>🎥 Upload &amp; Stream Video (OpenCV + FastAPI)</h1>
+
+    <div class="upload-box">
+      <input type="file" id="videoInput" accept="video/*" />
+      <button id="uploadBtn">Upload &amp; Stream</button>
+      <p id="statusMsg"></p>
+    </div>
+
+    <div class="stream-box" id="streamBox" style="display:none;">
+      <div class="stream-header">
+        <h2 id="streamTitle">Live Stream</h2>
+        <label class="switch">
+          <input type="checkbox" id="detectToggle" checked />
+          <span>Person detection</span>
+        </label>
+      </div>
+      <img id="videoStream" alt="Video stream" />
+    </div>
+  </div>
+
+  <script src="/static/script.js"></script>
+</body>
+</html>
