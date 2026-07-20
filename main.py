@@ -276,52 +276,36 @@
 
 
 
-import asyncio
-import fractions
 import os
 import shutil
 import time
 import threading
 
 import cv2
-import numpy as np
 import torch
-from av import VideoFrame
 from fastapi import FastAPI, File, UploadFile
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import StreamingResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
 from ultralytics import YOLO
 
-from aiortc import (
-    RTCPeerConnection,
-    RTCSessionDescription,
-    RTCConfiguration,
-    RTCIceServer,
-    VideoStreamTrack,
-)
-
-# aiortc's H264 encoder defaults to a 3 Mbps ceiling, which can exceed a
-# constrained real-world link once its congestion control ramps up - and since
-# RTP doesn't retransmit lost real-time video packets, any resulting loss shows
-# up directly as skipped/glitched frames. Cap it to a safer ceiling.
-import aiortc.codecs.h264 as _h264_codec
-_h264_codec.DEFAULT_BITRATE = 1_000_000   # 1 Mbps starting point
-_h264_codec.MIN_BITRATE = 400_000         # 400 kbps floor
-_h264_codec.MAX_BITRATE = 3_000_000       # 3 Mbps ceiling
-
-app = FastAPI(title="OpenCV + YOLO WebRTC Streamer")
+app = FastAPI(title="OpenCV + YOLO MJPEG Streamer")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 UPLOAD_DIR = os.path.join(BASE_DIR, "uploads")
-STATIC_DIR = os.path.join(BASE_DIR, "static")
+STATIC_DIR = os.path.join(BASE_DIR, "static2")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static2")
 
-# downscale before encoding; smaller frames = less encoder work and less data
-# for the same perceived quality at a given bitrate ceiling
-STREAM_MAX_WIDTH = 640
+# Transport tuning. The single-slot pipeline (below) already self-regulates
+# frame RATE under congestion - a slow socket makes the consumer pull fewer
+# frames and older ones are dropped, so no queue builds and latency stays flat.
+# That means we don't need an adaptive quality ladder; a fixed, modest
+# resolution + JPEG quality keeps per-frame size predictable, and JPEG encodes
+# much faster and with far less frame-to-frame variance than WebP (the old
+# variance was a real source of visible jitter).
+STREAM_MAX_WIDTH = 560   # transport downscale; inference still runs full-res
+JPEG_QUALITY = 65        # good quality/size tradeoff for a constrained link
 
 # Keep track of the currently uploaded video, whether detection is on,
 # and a lock so only one capture reads the file at a time.
@@ -421,7 +405,7 @@ def detect_persons(frame):
 # ---------------------------------------------------------------------------
 # Frame pipeline: producer (decode + YOLO at source pace) -> single-slot
 # buffer (newest frame wins, older frames dropped) -> per-client consumer
-# (adaptive resize + WebP encode + send)
+# (resize + JPEG encode + send)
 # ---------------------------------------------------------------------------
 class LatestFrameSlot:
     """Single-slot handoff between the producer and a stream consumer.
@@ -516,7 +500,14 @@ class FrameProducer(threading.Thread):
 
                 ok, frame = cap.read()
                 if not ok:
-                    break  # end of video
+                    # end of file: loop back to the start and re-anchor the
+                    # pacing clock so playback stays smooth and real-time
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                    ok, frame = cap.read()
+                    if not ok:
+                        break  # genuinely unreadable, not just EOF
+                    start = time.perf_counter()
+                    frame_idx = 0
                 frame_idx += 1
 
                 # YOLO always sees the full-resolution decoded frame; network
@@ -531,114 +522,75 @@ class FrameProducer(threading.Thread):
             self.slot.close()
 
 
-class PersonDetectionTrack(VideoStreamTrack):
-    """WebRTC video track fed by a FrameProducer via a LatestFrameSlot.
+def generate_frames(slot: LatestFrameSlot):
+    """Per-client consumer: take the newest annotated frame, downscale for
+    transport, JPEG-encode, and yield it as a multipart part.
 
-    Decode + YOLO run on the producer's own real-time clock; this track just
-    pulls the newest annotated frame, downscales it for transport, and hands
-    it to aiortc's H264 encoder. Because the slot is newest-wins, a slow
-    encoder or network never queues frames - it just skips to the latest one,
-    keeping latency flat. Bitrate/quality adaptation is handled by WebRTC's
-    own congestion control (and the H264 bitrate caps set at import time),
-    which is why the hand-rolled resolution ladder is gone."""
+    No adaptive ladder: the slot's newest-wins handoff means that when the
+    TCP send blocks under congestion, we simply pull the next frame later and
+    intervening frames were already dropped - so the stream self-throttles on
+    frame rate with flat latency. All resizing here is transport-only;
+    inference already ran at full resolution in the producer."""
+    last_seq = 0
+    encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY]
 
-    def __init__(self, slot: LatestFrameSlot, source_fps: float):
-        super().__init__()
-        self.slot = slot
-        self.source_fps = source_fps if source_fps and source_fps > 0 else 25.0
-        self._last_seq = 0
-        self._last_frame = None
-        self._time_base = fractions.Fraction(1, int(round(self.source_fps)))
-
-    async def recv(self):
-        # aiortc's base VideoStreamTrack paces recv() to real time and gives us
-        # monotonic pts/time_base via next_timestamp()
-        pts, time_base = await self.next_timestamp()
-
-        # pull the newest frame without blocking the event loop; if none is
-        # newer yet, reuse the last one so the encoder keeps a steady cadence
-        frame, self._last_seq = await asyncio.get_event_loop().run_in_executor(
-            None, self.slot.get_newer, self._last_seq, 1.0
-        )
+    while True:
+        frame, last_seq = slot.get_newer(last_seq)
         if frame is None:
-            frame = self._last_frame
-        else:
-            self._last_frame = frame
+            if slot.closed:
+                break  # end of video / producer gone
+            continue  # spurious timeout; keep waiting
 
-        if frame is None:
-            frame = np.zeros((360, 640, 3), dtype=np.uint8)
-
-        # transport-only downscale; inference already ran at full res upstream
         h, w = frame.shape[:2]
         if w > STREAM_MAX_WIDTH:
             scale = STREAM_MAX_WIDTH / w
             frame = cv2.resize(frame, (STREAM_MAX_WIDTH, int(h * scale)),
                                interpolation=cv2.INTER_AREA)
 
-        video_frame = VideoFrame.from_ndarray(frame, format="bgr24")
-        video_frame.pts = pts
-        video_frame.time_base = time_base
-        return video_frame
+        ok, buffer = cv2.imencode(".jpg", frame, encode_params)
+        if not ok:
+            continue
+        frame_bytes = buffer.tobytes()
+
+        yield (
+            b"--frame\r\n"
+            b"Content-Type: image/jpeg\r\n"
+            b"Content-Length: " + str(len(frame_bytes)).encode() + b"\r\n\r\n"
+            + frame_bytes + b"\r\n"
+        )
 
 
-class OfferPayload(BaseModel):
-    sdp: str
-    type: str
-
-
-# active peer connections, so we can tear them all down on shutdown
-peer_connections: set[RTCPeerConnection] = set()
-
-
-@app.post("/offer")
-async def offer(payload: OfferPayload):
+@app.get("/video_feed")
+def video_feed():
     video_path = state["video_path"]
     if not video_path or not os.path.exists(video_path):
         return JSONResponse(status_code=404, content={"error": "No video uploaded yet"})
-
-    offer_desc = RTCSessionDescription(sdp=payload.sdp, type=payload.type)
-
-    # STUN discovers our public address for ICE. Behind strict NATs / cloud
-    # firewalls a TURN relay is needed - set TURN_URL/USERNAME/CREDENTIAL.
-    ice_servers = [RTCIceServer(urls="stun:stun.l.google.com:19302")]
-    turn_url = os.environ.get("TURN_URL")
-    if turn_url:
-        ice_servers.append(RTCIceServer(
-            urls=turn_url,
-            username=os.environ.get("TURN_USERNAME", ""),
-            credential=os.environ.get("TURN_CREDENTIAL", ""),
-        ))
-
-    pc = RTCPeerConnection(configuration=RTCConfiguration(iceServers=ice_servers))
-    peer_connections.add(pc)
 
     slot = LatestFrameSlot()
     producer = FrameProducer(video_path, slot)
     producer.start()
 
-    @pc.on("connectionstatechange")
-    async def on_connectionstatechange():
-        print(f"[webrtc] connection state: {pc.connectionState}")
-        if pc.connectionState in ("failed", "closed", "disconnected"):
+    def stream():
+        try:
+            yield from generate_frames(slot)
+        finally:
+            # client disconnected or stream ended: tear the producer down so
+            # no thread/capture outlives the request
             producer.stop()
             slot.close()
-            await pc.close()
-            peer_connections.discard(pc)
 
-    pc.addTrack(PersonDetectionTrack(slot, state["fps"]))
-
-    await pc.setRemoteDescription(offer_desc)
-    answer = await pc.createAnswer()
-    await pc.setLocalDescription(answer)
-
-    return {"sdp": pc.localDescription.sdp, "type": pc.localDescription.type}
-
-
-@app.on_event("shutdown")
-async def on_shutdown():
-    for pc in list(peer_connections):
-        await pc.close()
-    peer_connections.clear()
+    return StreamingResponse(
+        stream(),
+        media_type="multipart/x-mixed-replace; boundary=frame",
+        headers={
+            # discourage nginx-style reverse proxies from buffering the stream
+            # before forwarding it to the browser
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "Pragma": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
 
 
 @app.post("/toggle_detect")
