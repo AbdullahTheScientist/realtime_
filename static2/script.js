@@ -20,10 +20,12 @@ const DISPLAY_INTERVAL = 1000 / DISPLAY_FPS;
 const TARGET_BUFFER = 3;   // frames to accumulate before (re)starting playback
 const MAX_BUFFER = 8;      // hard cap; drop oldest beyond this to bound latency
 
-let frameQueue = [];
+let frameQueue = [];       // {seq, bmp}, kept sorted ascending by seq
 let needCushion = true;    // re-arm the startup cushion after any dry-out
 let lastPaint = 0;
 let rafId = null;
+let parseSeq = 0;          // increments per frame parsed off the wire
+let lastShownSeq = -1;     // highest seq already painted; drop anything older
 
 let abortCtrl = null;
 let recvBuf = new Uint8Array(0);
@@ -65,19 +67,28 @@ function drainParts() {
     const start = sep + HEADER_SEP.length;
     if (recvBuf.length < start + len) return; // body not fully arrived yet
     const jpeg = recvBuf.subarray(start, start + len);
-    enqueueFrame(jpeg.slice()); // copy out before we advance the buffer
+    enqueueFrame(jpeg.slice(), parseSeq++); // copy out before we advance the buffer
     recvBuf = recvBuf.subarray(start + len);
   }
 }
 
-function enqueueFrame(bytes) {
+function enqueueFrame(bytes, seq) {
   const blob = new Blob([bytes], { type: "image/jpeg" });
-  // createImageBitmap decodes off the main thread; ignore late decodes after stop
+  // createImageBitmap decodes off the main thread, so decodes finish OUT of
+  // arrival order. We tag each frame with its wire sequence and insert it in
+  // sorted position, dropping any frame that finished so late we've already
+  // painted a newer one - otherwise the display would jump backwards.
   createImageBitmap(blob).then((bmp) => {
     if (abortCtrl === null) { bmp.close(); return; }
-    frameQueue.push(bmp);
+    if (seq <= lastShownSeq) { bmp.close(); return; } // too late, already past it
+
+    // insertion sort by seq (queue is tiny, a few frames at most)
+    let i = frameQueue.length;
+    while (i > 0 && frameQueue[i - 1].seq > seq) i--;
+    frameQueue.splice(i, 0, { seq, bmp });
+
     while (frameQueue.length > MAX_BUFFER) {
-      frameQueue.shift().close(); // drop oldest to bound latency
+      frameQueue.shift().bmp.close(); // drop oldest to bound latency
     }
   }).catch(() => {}); // skip undecodable frame
 }
@@ -100,7 +111,8 @@ function renderLoop(ts) {
     return;
   }
 
-  const bmp = frameQueue.shift();
+  const { seq, bmp } = frameQueue.shift();
+  lastShownSeq = seq; // never paint an older frame after this one
   if (canvas.width !== bmp.width || canvas.height !== bmp.height) {
     canvas.width = bmp.width;
     canvas.height = bmp.height;
@@ -121,10 +133,12 @@ function stopStream() {
     cancelAnimationFrame(rafId);
     rafId = null;
   }
-  frameQueue.forEach((b) => b.close());
+  frameQueue.forEach((f) => f.bmp.close());
   frameQueue = [];
   recvBuf = new Uint8Array(0);
   needCushion = true;
+  parseSeq = 0;
+  lastShownSeq = -1;
 }
 
 async function startStream() {
