@@ -35,8 +35,8 @@ INFER_SIZE = 320   # inference resolution; 320 is a good speed/accuracy tradeoff
 # WebP instead of JPEG: same bitrate budget, better perceptual quality,
 # since WebP compresses ~25-35% smaller than JPEG at equivalent quality.
 # All modern browsers decode WebP natively via createImageBitmap.
-STREAM_MAX_WIDTH = 800
-STREAM_QUALITY = 68     # 0-100; roughly comparable to JPEG quality but compresses further
+STREAM_MAX_WIDTH = 640
+STREAM_QUALITY = 50     # 0-100; roughly comparable to JPEG quality but compresses further
 
 DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
 print(f"[startup] YOLO will run on: {DEVICE}"
