@@ -19,7 +19,7 @@ const ctx = canvas.getContext("2d");
 // on a steady timer. This trades a small fixed delay (a few hundred ms)
 // for much smoother playback.
 
-const TARGET_BUFFER_FRAMES = 6; // frames to queue before playback starts
+const TARGET_BUFFER_FRAMES = 10; // frames to queue before playback starts
 let frameQueue = [];
 let playing = false;
 let playTimer = null;
@@ -120,8 +120,35 @@ async function startStream(fps) {
     if (err.name !== "AbortError") console.error("Stream error:", err);
   });
 
+  // schedule against an absolute clock (startTime + n*interval) instead of
+  // chaining relative setTimeout delays, which drift over time as each
+  // frame's draw/decode work eats into the "interval" gap
+  let playbackStartTime = null;
+  let framesPlayed = 0;
+  const REBUFFER_THRESHOLD = 2; // if queue drops to this many frames mid-stream, pause briefly to refill
+  let rebuffering = false;
+
   const playLoop = () => {
     if (!playing) return;
+
+    if (!rebuffering && frameQueue.length <= REBUFFER_THRESHOLD && frameQueue.length < TARGET_BUFFER_FRAMES) {
+      // running low - pause playback briefly rather than stuttering frame-by-frame
+      rebuffering = true;
+      bufferMsg.textContent = "Rebuffering...";
+    }
+
+    if (rebuffering) {
+      if (frameQueue.length >= TARGET_BUFFER_FRAMES) {
+        rebuffering = false;
+        bufferMsg.textContent = "";
+        // resync the clock so we don't try to "catch up" all at once
+        playbackStartTime = null;
+        framesPlayed = 0;
+      } else {
+        playTimer = setTimeout(playLoop, 50);
+        return;
+      }
+    }
 
     if (frameQueue.length > 0) {
       const bmp = frameQueue.shift();
@@ -132,11 +159,13 @@ async function startStream(fps) {
       ctx.drawImage(bmp, 0, 0);
       bmp.close && bmp.close();
       bufferMsg.textContent = `Buffer: ${frameQueue.length} frame(s)`;
-    } else {
-      bufferMsg.textContent = "Waiting for frames...";
     }
 
-    playTimer = setTimeout(playLoop, interval);
+    framesPlayed++;
+    if (playbackStartTime === null) playbackStartTime = performance.now();
+    const targetTime = playbackStartTime + framesPlayed * interval;
+    const delay = Math.max(0, targetTime - performance.now());
+    playTimer = setTimeout(playLoop, delay);
   };
 
   // wait until we have a small buffer built up before starting playback,
@@ -239,4 +268,4 @@ detectToggle.addEventListener("change", async () => {
       .then((r) => r.json())
       .then((s) => startStream(s.fps));
   }
-}); 
+});
