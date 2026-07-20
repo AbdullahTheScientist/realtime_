@@ -19,7 +19,7 @@ const ctx = canvas.getContext("2d");
 // on a steady timer. This trades a small fixed delay (a few hundred ms)
 // for much smoother playback.
 
-const TARGET_BUFFER_FRAMES = 10; // frames to queue before playback starts
+const TARGET_BUFFER_FRAMES = 14; // frames to queue before playback starts
 let frameQueue = [];
 let playing = false;
 let playTimer = null;
