@@ -18,6 +18,20 @@ from ultralytics import YOLO
 from aiortc import RTCPeerConnection, RTCSessionDescription, RTCConfiguration, RTCIceServer
 from aiortc import VideoStreamTrack
 
+# aiortc's H264 encoder defaults to a 3 Mbps ceiling, which can exceed a
+# constrained real-world link (confirmed ~2.7 Mbps here) once its congestion
+# control ramps up - and since RTP doesn't retransmit lost real-time video
+# packets, any resulting loss shows up directly as skipped/glitched frames.
+# Cap it to a safer ceiling with margin below the known link capacity.
+import aiortc.codecs.h264 as _h264_codec
+_h264_codec.DEFAULT_BITRATE = 700_000    # 700 kbps starting point
+_h264_codec.MIN_BITRATE = 300_000        # 300 kbps floor
+_h264_codec.MAX_BITRATE = 1_800_000      # 1.8 Mbps ceiling - safe margin under 2.7 Mbps
+
+STREAM_MAX_WIDTH = 640  # downscale before encoding; smaller frames = less work
+                         # for the encoder and less data needed for the same
+                         # perceived quality at a given bitrate ceiling
+
 app = FastAPI(title="OpenCV + YOLO WebRTC Streamer")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -184,6 +198,14 @@ class PersonDetectionTrack(VideoStreamTrack):
         if state["detect"]:
             frame = await asyncio.get_event_loop().run_in_executor(None, detect_persons, frame)
 
+        # downscale before handing to the encoder - smaller frames need less
+        # data for the same visual quality at a given bitrate ceiling, and
+        # cost the (CPU-bound) H264/VP8 encoder less work per frame
+        h, w = frame.shape[:2]
+        if w > STREAM_MAX_WIDTH:
+            scale = STREAM_MAX_WIDTH / w
+            frame = cv2.resize(frame, (STREAM_MAX_WIDTH, int(h * scale)))
+
         self._frame_count += 1
 
         video_frame = VideoFrame.from_ndarray(frame, format="bgr24")
@@ -247,7 +269,6 @@ async def on_shutdown():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=False)
-
 
 
 
