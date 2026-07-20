@@ -3,12 +3,12 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>OpenCV Video Streamer</title>
+  <title>OpenCV + YOLO WebRTC Streamer</title>
   <link rel="stylesheet" href="/static/style.css" />
 </head>
 <body>
   <div class="container">
-    <h1>🎥 Upload &amp; Stream Video (OpenCV + FastAPI)</h1>
+    <h1>🎥 Upload &amp; Stream Video (WebRTC + YOLO)</h1>
 
     <div class="upload-box">
       <input type="file" id="videoInput" accept="video/*" />
@@ -28,8 +28,8 @@
           <span>Person detection</span>
         </label>
       </div>
-      <canvas id="videoCanvas"></canvas>
-      <p id="bufferMsg" class="hint"></p>
+      <video id="videoEl" autoplay playsinline muted></video>
+      <p id="connMsg" class="hint"></p>
     </div>
   </div>
 
