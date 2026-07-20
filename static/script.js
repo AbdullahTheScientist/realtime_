@@ -6,6 +6,9 @@ const streamTitle = document.getElementById("streamTitle");
 const detectToggle = document.getElementById("detectToggle");
 const canvas = document.getElementById("videoCanvas");
 const bufferMsg = document.getElementById("bufferMsg");
+const progressWrap = document.getElementById("progressWrap");
+const progressBar = document.getElementById("progressBar");
+const progressLabel = document.getElementById("progressLabel");
 const ctx = canvas.getContext("2d");
 
 // --- Jitter-buffered MJPEG player -----------------------------------------
@@ -150,6 +153,41 @@ async function startStream(fps) {
   waitForBuffer();
 }
 
+function uploadWithProgress(file, onProgress) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    const formData = new FormData();
+    formData.append("file", file);
+
+    xhr.upload.addEventListener("progress", (e) => {
+      if (e.lengthComputable) {
+        onProgress(Math.round((e.loaded / e.total) * 100));
+      }
+    });
+
+    xhr.addEventListener("load", () => {
+      let data;
+      try {
+        data = JSON.parse(xhr.responseText);
+      } catch (e) {
+        reject(new Error("Server returned an invalid response"));
+        return;
+      }
+      if (xhr.status >= 200 && xhr.status < 300) {
+        resolve(data);
+      } else {
+        reject(new Error(data.error || `Upload failed (status ${xhr.status})`));
+      }
+    });
+
+    xhr.addEventListener("error", () => reject(new Error("Network error during upload")));
+    xhr.addEventListener("abort", () => reject(new Error("Upload aborted")));
+
+    xhr.open("POST", "/upload");
+    xhr.send(formData);
+  });
+}
+
 uploadBtn.addEventListener("click", async () => {
   const file = videoInput.files[0];
   if (!file) {
@@ -157,30 +195,32 @@ uploadBtn.addEventListener("click", async () => {
     return;
   }
 
-  const formData = new FormData();
-  formData.append("file", file);
-
   uploadBtn.disabled = true;
-  statusMsg.textContent = "Uploading...";
   streamBox.style.display = "none";
   stopStream();
 
-  try {
-    const res = await fetch("/upload", { method: "POST", body: formData });
-    const data = await res.json();
+  progressWrap.style.display = "block";
+  progressBar.style.width = "0%";
+  progressLabel.textContent = "0%";
+  statusMsg.textContent = "Uploading...";
 
-    if (!res.ok) {
-      statusMsg.textContent = "Error: " + (data.error || "upload failed");
-      return;
-    }
+  try {
+    const data = await uploadWithProgress(file, (pct) => {
+      progressBar.style.width = pct + "%";
+      progressLabel.textContent = pct + "%";
+      statusMsg.textContent = pct < 100 ? "Uploading..." : "Processing on server...";
+    });
 
     statusMsg.textContent = `Uploaded "${data.filename}". Starting stream...`;
     streamTitle.textContent = `Live Stream: ${data.filename}`;
     streamBox.style.display = "block";
+    progressWrap.style.display = "none";
 
     startStream(data.fps);
   } catch (err) {
     statusMsg.textContent = "Upload failed: " + err.message;
+    progressWrap.style.display = "none";
+    console.error("Upload error:", err);
   } finally {
     uploadBtn.disabled = false;
   }
@@ -199,4 +239,4 @@ detectToggle.addEventListener("change", async () => {
       .then((r) => r.json())
       .then((s) => startStream(s.fps));
   }
-});
+}); 
