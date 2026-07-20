@@ -480,6 +480,11 @@ class FrameProducer(threading.Thread):
 
         start = time.perf_counter()
         frame_idx = 0
+        # instrumentation: how well the producer holds source fps
+        stat_t0 = start
+        stat_frames = 0      # frames actually decoded + published this window
+        stat_skipped = 0     # frames dropped (grab-only) to catch up this window
+        stat_infer_s = 0.0   # cumulative YOLO time this window
         try:
             while not self._stop_event.is_set():
                 # absolute-clock pacing (start + n*interval) instead of
@@ -497,6 +502,7 @@ class FrameProducer(threading.Thread):
                         if not cap.grab():
                             break
                         frame_idx += 1
+                        stat_skipped += 1
 
                 ok, frame = cap.read()
                 if not ok:
@@ -514,9 +520,23 @@ class FrameProducer(threading.Thread):
                 # adaptation happens later, on a copy in the consumer, and
                 # never affects inference input
                 if state["detect"]:
+                    _inf0 = time.perf_counter()
                     frame = detect_persons(frame)
+                    stat_infer_s += time.perf_counter() - _inf0
 
                 self.slot.put(frame)
+                stat_frames += 1
+
+                elapsed = now - stat_t0
+                if elapsed >= 2.0:
+                    infer_ms = (stat_infer_s / stat_frames * 1000) if stat_frames else 0.0
+                    print(f"[producer] {stat_frames / elapsed:.1f} fps produced, "
+                          f"{stat_skipped} skipped, {infer_ms:.0f} ms/frame YOLO "
+                          f"(source {fps:.0f} fps)")
+                    stat_t0 = now
+                    stat_frames = 0
+                    stat_skipped = 0
+                    stat_infer_s = 0.0
         finally:
             cap.release()
             self.slot.close()
@@ -533,6 +553,14 @@ def generate_frames(slot: LatestFrameSlot):
     inference already ran at full resolution in the producer."""
     last_seq = 0
     encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY]
+    # instrumentation: sent fps, encode cost, frame size, and socket-send stall
+    stat_t0 = time.perf_counter()
+    stat_sent = 0
+    stat_enc_s = 0.0
+    stat_send_s = 0.0
+    stat_bytes = 0
+    stat_send_max = 0.0
+    _last_yield = stat_t0
 
     while True:
         frame, last_seq = slot.get_newer(last_seq)
@@ -540,6 +568,12 @@ def generate_frames(slot: LatestFrameSlot):
             if slot.closed:
                 break  # end of video / producer gone
             continue  # spurious timeout; keep waiting
+
+        _enc0 = time.perf_counter()
+        # the gap between finishing the previous yield and now is how long the
+        # socket send blocked (backpressure) plus wait-for-frame; under
+        # congestion this is where time goes
+        send_block = _enc0 - _last_yield
 
         h, w = frame.shape[:2]
         if w > STREAM_MAX_WIDTH:
@@ -551,6 +585,7 @@ def generate_frames(slot: LatestFrameSlot):
         if not ok:
             continue
         frame_bytes = buffer.tobytes()
+        enc_s = time.perf_counter() - _enc0
 
         yield (
             b"--frame\r\n"
@@ -558,6 +593,27 @@ def generate_frames(slot: LatestFrameSlot):
             b"Content-Length: " + str(len(frame_bytes)).encode() + b"\r\n\r\n"
             + frame_bytes + b"\r\n"
         )
+        _last_yield = time.perf_counter()
+
+        stat_sent += 1
+        stat_enc_s += enc_s
+        stat_send_s += send_block
+        stat_send_max = max(stat_send_max, send_block)
+        stat_bytes += len(frame_bytes)
+        window = _last_yield - stat_t0
+        if window >= 2.0:
+            mbps = stat_bytes * 8 / window / 1e6
+            print(f"[consumer] {stat_sent / window:.1f} fps sent, "
+                  f"enc {stat_enc_s / stat_sent * 1000:.0f} ms, "
+                  f"send-stall avg {stat_send_s / stat_sent * 1000:.0f} ms "
+                  f"max {stat_send_max * 1000:.0f} ms, "
+                  f"{stat_bytes // stat_sent // 1024} KB/frame, {mbps:.1f} Mbps")
+            stat_t0 = _last_yield
+            stat_sent = 0
+            stat_enc_s = 0.0
+            stat_send_s = 0.0
+            stat_send_max = 0.0
+            stat_bytes = 0
 
 
 @app.get("/video_feed")
