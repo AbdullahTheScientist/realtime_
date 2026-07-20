@@ -308,8 +308,8 @@ INFER_SIZE = 320   # inference resolution; 320 is a good speed/accuracy tradeoff
 # Output stream settings - these control how much data has to travel over the
 # network per frame. If playback lags/slows down, the network can't keep up
 # with the current bitrate; lower STREAM_MAX_WIDTH and/or JPEG_QUALITY first.
-STREAM_MAX_WIDTH = 640   # frames wider than this get downscaled before sending
-JPEG_QUALITY = 65        # 0-100; lower = smaller frames = less bandwidth needed
+STREAM_MAX_WIDTH = 480   # frames wider than this get downscaled before sending
+JPEG_QUALITY = 49        # 0-100; lower = smaller frames = less bandwidth needed
 
 DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
 print(f"[startup] YOLO will run on: {DEVICE}"
