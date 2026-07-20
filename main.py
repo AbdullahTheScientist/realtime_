@@ -306,6 +306,13 @@ app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static2")
 # variance was a real source of visible jitter).
 STREAM_MAX_WIDTH = 560   # transport downscale; inference still runs full-res
 JPEG_QUALITY = 65        # good quality/size tradeoff for a constrained link
+# Cap the SENT frame rate below the source. Measured delivery sits right at the
+# link ceiling at 24 fps (socket send blocks ~31 of every ~41 ms), leaving no
+# headroom - so any network dip lands a frame late and the <img> element, which
+# has no jitter buffer, stutters. Sending 15 fps cuts bandwidth ~40% and makes
+# each frame's delivery uniform. YOLO still runs on every source frame; the
+# newest-wins slot just drops the frames we skip, adding zero latency.
+STREAM_FPS = 15
 
 # Keep track of the currently uploaded video, whether detection is on,
 # and a lock so only one capture reads the file at a time.
@@ -553,6 +560,8 @@ def generate_frames(slot: LatestFrameSlot):
     inference already ran at full resolution in the producer."""
     last_seq = 0
     encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY]
+    send_interval = 1.0 / STREAM_FPS if STREAM_FPS and STREAM_FPS > 0 else 0.0
+    next_send = time.perf_counter()
     # instrumentation: sent fps, encode cost, frame size, and socket-send stall
     stat_t0 = time.perf_counter()
     stat_sent = 0
@@ -568,6 +577,14 @@ def generate_frames(slot: LatestFrameSlot):
             if slot.closed:
                 break  # end of video / producer gone
             continue  # spurious timeout; keep waiting
+
+        # pace the SENT rate: if this frame arrived before the next send slot,
+        # skip it. The slot is newest-wins, so skipping just means we'll grab a
+        # fresher frame at the slot time - no latency added, no queue built.
+        now = time.perf_counter()
+        if send_interval > 0.0 and now < next_send:
+            continue
+        next_send = max(next_send + send_interval, now)
 
         _enc0 = time.perf_counter()
         # the gap between finishing the previous yield and now is how long the
